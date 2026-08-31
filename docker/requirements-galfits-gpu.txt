@@ -1,0 +1,42 @@
+# Unified MCP + GalfitS GPU runtime.
+#
+# The CUDA/JAX pins mirror galaxy_morphology_mcp:0.0.15, which was verified on
+# this host with CUDA 12.4, driver 550.78 and two RTX 3090 GPUs.  Keep the four
+# JAX packages aligned; installing plain jax/jaxlib alone produces a CPU build.
+jax==0.8.0
+jaxlib==0.8.0
+jax-cuda12-plugin==0.8.0
+jax-cuda12-pjrt==0.8.0
+nvidia-cudnn-cu12>=9.0.0
+
+# GalfitS image processing and result-generation dependencies.
+numpy==2.4.6
+scipy==1.17.1
+pandas==3.0.3
+astropy==8.0.1
+photutils==3.0.0
+astroquery==0.4.11
+reproject==0.21.0
+sep==1.4.1
+scikit-image==0.26.0
+corner==2.3.0
+regions
+h5py
+spectral-cube
+matplotlib==3.11.0
+pillow==12.3.0
+PyYAML==6.0.3
+
+# GalfitS optimization stack.
+dynesty==3.0.0
+optax==0.2.8
+jaxopt==0.8.5
+lmfit==1.3.4
+evosax==0.2.0
+flax==0.12.0
+chex==0.1.92
+flowMC==0.4.5
+tqdm==4.68.4
+
+# Version used by the known-good legacy MCP image.
+mcp==1.28.1

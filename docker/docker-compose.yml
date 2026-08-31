@@ -1,0 +1,29 @@
+name: galaxy_agent_docker
+
+services:
+  galaxy-agent:
+    image: galaxy-agent:gpu-local
+    build:
+      context: .
+      additional_contexts:
+        mcp_source: ../../new_version/galaxy_morphology_mcp
+        communication_source: ..
+        galfits_source: /home/ad/galfits/GalfitS
+        galfit_source: /usr/local/bin
+        claude_source: /home/ad/.local/share/claude/versions
+      args:
+        CODEX_VERSION: 0.144.6
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8010:8010"
+    volumes:
+      - ./runtime/data:/data
+      # Persist CLI authentication outside the image. This includes
+      # ~/.claude.json, ~/.claude/ and ~/.codex/ for the container user.
+      - ./runtime/home:/home/agent
+    gpus: all
+    # The image already uses tini as ENTRYPOINT; a second Compose init process
+    # would make the inner tini warn that it is not PID 1.
+    restart: unless-stopped

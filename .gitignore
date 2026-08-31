@@ -1,0 +1,24 @@
+# Local runtime configuration and secrets
+.env
+!.env.example
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Service runtime logs and state
+*.log
+log/
+*.sqlite3
+
+# Docker runtime data, CLI authentication, and exported images
+docker/runtime/
+docker/*.tar
+docker/*.tar.gz
+
+# Local tool authentication if copied into the repository
+.claude/
+.claude.json
+.codex/

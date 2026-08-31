@@ -1,0 +1,6 @@
+.env
+runtime/
+*.tar
+*.tar.gz
+*.log
+__pycache__/
