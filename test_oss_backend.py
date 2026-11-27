@@ -286,6 +286,36 @@ class OssBackendTest(unittest.TestCase):
                 ["/owner/project/galaxy/node-2/output/best_round_comparison.md"],
             )
 
+    def test_best_round_archive_maps_to_platform_node(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage_dir = Path(tmp)
+            (stage_dir / ".best_round.json").write_text(
+                json.dumps({"round_label": "20261027T163606.54891b8f"}),
+                encoding="utf-8",
+            )
+            request = {
+                "galaxy_dir": str(stage_dir),
+                "local_platform": {
+                    "round_nodes": {
+                        "1": {"node_id": "node-1"},
+                        "2": {"node_id": "node-2"},
+                        "3": {"node_id": "node-3"},
+                    }
+                },
+            }
+            rows = [
+                {"payload_json": json.dumps({"round_index": 1, "archive_dir": "/stage/archives/round-1"})},
+                {"payload_json": json.dumps({"round_index": 2, "archive_dir": "/stage/archives/20261027T163606.54891b8f"})},
+                {"payload_json": json.dumps({"round_index": 3, "archive_dir": "/stage/archives/round-3"})},
+            ]
+            connection = MagicMock()
+            connection.__enter__.return_value.execute.return_value.fetchall.return_value = rows
+            with patch.object(main, "_connect", return_value=connection):
+                result = main._best_round_selection("task", request)
+
+            self.assertEqual(result["selected_node_id"], "node-2")
+            self.assertEqual(result["selected_round_index"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

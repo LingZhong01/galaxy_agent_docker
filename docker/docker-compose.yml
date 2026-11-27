@@ -20,8 +20,8 @@ services:
       - "8010:8010"
     volumes:
       - ./runtime/data:/data
-      # Persist CLI authentication outside the image. This includes
-      # ~/.claude.json, ~/.claude/ and ~/.codex/ for the container user.
+      # Persist runtime CLI caches and optional Codex credentials. Claude uses
+      # ANTHROPIC_AUTH_TOKEN from .env and needs no mounted login files.
       - ./runtime/home:/home/agent
     gpus: all
     # The image already uses tini as ENTRYPOINT; a second Compose init process

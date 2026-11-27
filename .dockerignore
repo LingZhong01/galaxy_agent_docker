@@ -1,0 +1,11 @@
+.env
+.git/
+docker/
+log/
+runtime/
+__pycache__/
+*.pyc
+*.log
+*.tar
+*.tar.gz
+tests/

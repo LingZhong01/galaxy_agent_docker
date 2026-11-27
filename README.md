@@ -37,10 +37,34 @@ communication_service/
 
 ```bash
 pip install -r requirements.txt
-cp .env.example .env
 ```
 
-复制后请至少确认 MCP 工程路径、任务暂存目录、数据库目录、日志目录以及 Agent/Python 可执行文件路径。部署用户必须对 `LOCAL_GALFIT_STAGE_ROOT`、`COMMUNICATION_SERVICE_DB` 的父目录和 `COMMUNICATION_SERVICE_LOG_DIR` 具有写权限。
+### 本机启动配置
+
+本机启动只读取仓库根目录 `.env`。该文件采用与 `docker/.env` 相同的 Agent、模型网关、凭据和超时变量格式，并额外包含本机路径及可执行文件配置。显式设置的 shell 环境变量优先级最高。
+
+```text
+.env               # 本机运行的完整配置（唯一默认配置源）
+docker/.env        # Docker Compose 使用，不参与本机启动
+```
+
+直接启动：
+
+```bash
+./start-local.sh
+```
+
+当前根 `.env` 将 `COMMUNICATION_FILE_BACKEND` 设置为 `local`，并将暂存、SQLite 和日志放在：
+
+```text
+../oss_simulation_database/
+├── _communication_stage/
+└── _service/
+    ├── communication_service.sqlite3
+    └── log/
+```
+
+如需临时使用另一份完整配置，可设置 `COMMUNICATION_ENV_FILE=/path/to/.env`。该文件会完全替代根 `.env`，不会与 `docker/.env` 合并。部署用户必须对 `LOCAL_GALFIT_STAGE_ROOT`、`COMMUNICATION_SERVICE_DB` 的父目录和 `COMMUNICATION_SERVICE_LOG_DIR` 具有写权限。
 
 ## 配置
 
@@ -64,6 +88,8 @@ cp .env.example .env
 | `MCP_CONNECT_TIMEOUT_MS` | `120000` | Claude 首次请求等待 MCP 连接并生成工具快照的最长时间（毫秒） |
 | `CLAUDE_MODEL` | 空 | 可选 Claude 模型，例如 `sonnet` |
 | `CLAUDE_MAX_BUDGET_USD` | 空 | 可选的单任务 Claude API 费用上限 |
+| `ANTHROPIC_BASE_URL` | 空 | Claude CLI 直接连接的内部模型网关，例如 `http://IP:4000` |
+| `ANTHROPIC_AUTH_TOKEN` | 空 | 内部模型网关的鉴权信息 |
 | `MAX_CONCURRENT_CODEX_WORKERS` | `1` | 最大并发工作进程数 |
 | `LOCAL_GALFIT_STAGE_ROOT` | `code/agent/test_data` | 平台请求转换成本地任务时的暂存目录；生产环境必须使用独立目录，不要与人工测试数据混用 |
 | `STAGE_CLEANUP_ENABLED` | `true` | 是否启用暂存目录定期清理 |
@@ -104,6 +130,25 @@ Claude 模式会以 `GALAXY_MCP_ROOT` 为工作目录，因此会自动加载该
 `CLAUDE.md`、`.claude/agents` 和 `.claude/skills`；拟合暂存目录通过
 `--add-dir` 提供。客户端仍然请求同一个 `/api/local-fit-requests` API，
 请求 body 无需增加 Agent 类型。
+
+主流程仍使用 Claude CLI，直接连接内部 4000 端口的模型网关：
+
+```dotenv
+AGENT_BACKEND=claude
+ANTHROPIC_BASE_URL=http://IP:4000
+ANTHROPIC_AUTH_TOKEN=replace-with-real-key
+CLAUDE_MODEL=glm-5.3-csst-anthropic
+```
+
+communication service 不实现 GLM 转发或协议转换。Claude CLI 使用 Anthropic Messages
+协议，因此 4000 网关必须同时提供 Claude 所需的 Anthropic-compatible 接口；如果它确实
+只提供 `http://IP:4000/chat/completions`，则 Claude CLI 无法直接使用，网关侧仍需补充协议转换。
+
+平台可在任务请求顶层传入任意 JSON `bizInfo`。服务不解释其内部字段，只按任务保存，
+并通过 `BIZ_INFO_JSON` 传给 Claude/MCP 子进程。MCP 的 Gemini 请求会把原值放到
+`metadata.spend_logs_metadata.bizInfo`。Claude 主流程通过任务级
+`x-litellm-spend-logs-metadata` 请求头传递相同值；服务按网关约定将 `bizInfo`
+编码为 JSON 字符串，业务字段本身不做解析。
 
 `fit_type=human` 时，服务不会启动 Codex 或 Claude。OSS 输入暂存完成后，
 `direct_fit_runner.py` 会在 MCP Python 环境中直接调用一次拟合函数：

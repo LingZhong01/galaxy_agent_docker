@@ -5,13 +5,32 @@
 
 ## 部署前要求
 
-- 已导入 `galaxy-agent:gpu-local`
+- 可以访问 Harbor，或已导入 `galaxy-agent:gpu-local`
 - Docker 与 Docker Compose
 - NVIDIA 驱动
 - NVIDIA Container Toolkit
 - `docker-compose.yml` 和 `.env.example`
 
 目标服务器不需要单独安装 GalfitS、GALFIT、Conda、Codex 或 Claude。
+
+推荐直接从 Harbor 拉取 `0.0.2`：
+
+```bash
+docker login harbor.zhejianglab.com
+docker pull \
+  harbor.zhejianglab.com/galaxy_morphology_platform_module/galaxy-agent:0.0.2
+
+# 当前 Compose 使用本地运行标签 galaxy-agent:gpu-local
+docker tag \
+  harbor.zhejianglab.com/galaxy_morphology_platform_module/galaxy-agent:0.0.2 \
+  galaxy-agent:gpu-local
+```
+
+版本 `0.0.2` 的 Harbor manifest digest：
+
+```text
+sha256:088b4a5696b92cbfe572695b4a716131ce9823797987e300917dc368d9e614b4
+```
 
 ## 1. 进入部署目录
 
@@ -32,8 +51,13 @@ chmod 600 .env
 编辑 `.env`，至少确认：
 
 ```dotenv
-# 可选 codex 或 claude
-AGENT_BACKEND=codex
+# 主流程继续使用 Claude CLI
+AGENT_BACKEND=claude
+
+# Claude CLI 直接连接内部模型网关
+ANTHROPIC_BASE_URL=http://IP:4000
+ANTHROPIC_AUTH_TOKEN=replace-with-real-key
+CLAUDE_MODEL=glm-5.3-csst-anthropic
 
 AGENT_TIMEOUT_SEC=7200
 COMMUNICATION_SERVICE_PUBLIC_URL=http://127.0.0.1:8010
@@ -59,10 +83,17 @@ PYTHONNOUSERSITE=1
 
 ```dotenv
 OPENAI_API_KEY=
-OPENAI_BASE_URL=https://api.openai.com/v1
-OPENAI_MODEL=
+OPENAI_BASE_URL=http://internal-ip:4000
+OPENAI_MODEL=gemini-3.1-pro-preview-csst
 ANALYSIS_MODE=vlm
 ```
+
+平台提交 `/api/local-fit-requests` 时可在请求顶层携带任意 JSON `bizInfo`。服务不解析
+其结构，只透传给子进程；MCP 会将原值注入 Gemini 请求的
+`metadata.spend_logs_metadata.bizInfo`。Claude 主流程使用任务级
+`x-litellm-spend-logs-metadata` Header，其中 `bizInfo` 按网关要求编码为 JSON 字符串。
+
+Claude CLI 会调用网关的 `/v1/messages` Anthropic-compatible 接口。
 
 不要将包含真实密钥的 `.env` 提交到 Git。
 
@@ -82,6 +113,10 @@ runtime/home -> /home/agent
 runtime/data -> /data
 ```
 
+当前 Claude 主流程通过 `.env` 中的 `ANTHROPIC_AUTH_TOKEN` 鉴权，不需要在
+`runtime/home` 中放置 `.claude.json`、`.claude/` 或其他 Claude 登录文件。
+`runtime/home` 仅保留给可选的 CLI 缓存及 Codex 兼容模式。
+
 运行数据位于：
 
 ```text
@@ -92,7 +127,9 @@ runtime/data/log
 
 不要将 `runtime/` 提交到 Git。
 
-## 4. 导入 Codex 认证
+## 4. 可选：导入 Codex 认证
+
+当前设置 `AGENT_BACKEND=claude` 时可跳过本节。只有切换回 Codex backend 时才需要：
 
 推荐在目标服务器通过一次性容器登录：
 
@@ -115,61 +152,7 @@ chmod 600 runtime/home/.codex/auth.json
 
 不要复制 `models_cache.json`，避免 Codex CLI 版本不同造成缓存格式冲突。
 
-## 5. 导入 Claude 认证
-
-推荐在目标服务器通过一次性容器登录：
-
-```bash
-docker compose run --rm -it galaxy-agent claude
-```
-
-也可以复制宿主机已有认证：
-
-```bash
-mkdir -p runtime/home/.claude
-cp /home/ad/.claude.json runtime/home/.claude.json
-cp -a /home/ad/.claude/. runtime/home/.claude/
-sudo chown -R 1000:1000 runtime/home
-chmod 700 runtime/home runtime/home/.claude
-chmod 600 runtime/home/.claude.json
-```
-
-使用 Claude 时设置：
-
-```dotenv
-AGENT_BACKEND=claude
-```
-
-服务尚未启动时，通过一次性容器检查登录状态：
-
-```bash
-docker compose run --rm galaxy-agent claude auth status
-```
-
-服务已经启动时，直接检查正在运行的容器：
-
-```bash
-docker compose exec galaxy-agent claude auth status
-```
-
-登录成功时应包含：
-
-```json
-{
-  "loggedIn": true,
-  "authMethod": "oauth_token",
-  "apiProvider": "firstParty"
-}
-```
-
-判断登录是否成功时以 `"loggedIn": true` 为准；认证方式和 API Provider 可能随实际
-账号配置不同。若返回 `false`，重新执行：
-
-```bash
-docker compose run --rm -it galaxy-agent claude
-```
-
-## 6. 启动服务
+## 5. 启动服务
 
 镜像已经导入或构建完成时，不再触发构建：
 
@@ -186,7 +169,7 @@ curl http://127.0.0.1:8010/health
 
 其他机器可通过 `http://服务器IP:8010` 访问，但宿主机防火墙和安全组也必须允许该端口。
 
-## 7. 查看日志
+## 6. 查看日志
 
 ```bash
 docker compose logs -f --tail=200 galaxy-agent
@@ -198,7 +181,7 @@ docker compose logs -f --tail=200 galaxy-agent
 runtime/data/log
 ```
 
-## 8. 修改配置后重新加载
+## 7. 修改配置后重新加载
 
 仅执行 `docker compose restart` 不会重新注入修改后的 `.env`。应重新创建容器：
 
@@ -208,7 +191,7 @@ docker compose up -d --no-build --force-recreate
 
 挂载在 `runtime/home` 中的认证和 `runtime/data` 中的业务数据不会丢失。
 
-## 9. 验证统一环境和 GPU
+## 8. 验证统一环境和 GPU
 
 ```bash
 docker compose exec galaxy-agent \
@@ -221,7 +204,7 @@ docker compose exec galaxy-agent \
 如果输出路径来自 `/home/agent/.local/lib/python3.11/site-packages`，说明用户目录中的旧包
 覆盖了镜像环境。确认 `.env` 已设置 `PYTHONNOUSERSITE=1`，然后强制重新创建容器。
 
-## 10. 停止服务
+## 9. 停止服务
 
 停止但保留容器：
 

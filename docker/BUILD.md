@@ -30,6 +30,7 @@ GalfitS Python 环境。
   - `/usr/local/bin/galfit`
   - `/home/ad/.local/share/claude/versions/2.1.186`
   - 本地镜像 `galaxy_morphology_mcp:0.0.15`
+  - 本地上一版镜像 `galaxy-agent:gpu-local`（复用已验证的 Claude Agent SDK）
 
 旧镜像仅作为构建阶段来源，用于复制非 PyPI 的 MIT `jnesty` 源码及已验证版本的
 CUPTI/NVCC CUDA 组件。最终镜像运行时不依赖旧镜像。
@@ -140,3 +141,19 @@ docker image inspect galaxy-agent:gpu-local \
 ```
 
 导入后的服务配置和启动流程见 [DEPLOY.md](DEPLOY.md)。
+
+## 发布到 Harbor
+
+本次版本为 `0.0.2`：
+
+```bash
+docker tag galaxy-agent:gpu-local \
+  harbor.zhejianglab.com/galaxy_morphology_platform_module/galaxy-agent:0.0.2
+
+docker login harbor.zhejianglab.com
+
+docker push \
+  harbor.zhejianglab.com/galaxy_morphology_platform_module/galaxy-agent:0.0.2
+```
+
+发布完成后记录 `docker push` 输出的 digest，用于部署端核对镜像版本。

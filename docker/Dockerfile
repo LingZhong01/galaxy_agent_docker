@@ -4,10 +4,12 @@ ARG CUDA_IMAGE=nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 ARG NODE_IMAGE=node:22.23.0-bookworm-slim
 ARG MICROMAMBA_IMAGE=mambaorg/micromamba:2.3.2
 ARG LEGACY_GALFITS_IMAGE=galaxy_morphology_mcp:0.0.15
+ARG PREVIOUS_AGENT_IMAGE=galaxy-agent:gpu-local
 
 FROM ${NODE_IMAGE} AS node_runtime
 FROM ${MICROMAMBA_IMAGE} AS micromamba_runtime
 FROM ${LEGACY_GALFITS_IMAGE} AS legacy_galfits
+FROM ${PREVIOUS_AGENT_IMAGE} AS previous_agent
 FROM ${CUDA_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -51,6 +53,13 @@ COPY --from=legacy_galfits /usr/local/lib/python3.11/dist-packages/nvidia/cuda_n
   /opt/conda/envs/mcp/lib/python3.11/site-packages/nvidia/cuda_nvcc
 COPY --from=legacy_galfits /usr/local/lib/python3.11/dist-packages/nvidia_cuda_nvcc_cu12-12.9.86.dist-info \
   /opt/conda/envs/mcp/lib/python3.11/site-packages/nvidia_cuda_nvcc_cu12-12.9.86.dist-info
+
+# Reuse the previously validated SDK instead of downloading its 108 MB wheel
+# on every local rebuild. The project requires claude-agent-sdk>=0.1.0.
+COPY --from=previous_agent /opt/conda/envs/mcp/lib/python3.11/site-packages/claude_agent_sdk \
+  /opt/conda/envs/mcp/lib/python3.11/site-packages/claude_agent_sdk
+COPY --from=previous_agent /opt/conda/envs/mcp/lib/python3.11/site-packages/claude_agent_sdk-0.2.145.dist-info \
+  /opt/conda/envs/mcp/lib/python3.11/site-packages/claude_agent_sdk-0.2.145.dist-info
 
 # These named BuildKit contexts are supplied by build-local.sh/docker-compose.yml.
 # Copy only explicit paths so source .env files, Git metadata, logs and credentials

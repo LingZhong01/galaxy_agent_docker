@@ -36,6 +36,109 @@ class AgentBackendTests(unittest.TestCase):
             self.assertIn("best-round-verifier.md", command[-1])
             self.assertEqual(main._agent_cwd(self.request), str(main.SETTINGS.mcp_root))
 
+    def test_backend_biz_info_alias_is_preserved(self) -> None:
+        biz_info = {
+            "env": "sg",
+            "bizType": "a1",
+            "bizId": "session_88",
+            "userId": "user_123",
+            "randomId": "fdsafd",
+            "instruction": "自动完成 bulge + disk 拟合",
+        }
+        body = main.LocalFitRequestIn.model_validate(
+            {
+                "owner": "owner",
+                "project_name": "project",
+                "galaxy_id": "galaxy",
+                "node_id": "node",
+                "bizInfo": biz_info,
+                "current_metadata": {"input_dir": "/tmp/input", "output_dir": "/tmp/output"},
+            }
+        )
+        self.assertEqual(body.biz_info, biz_info)
+        request = {**self.request, "bizInfo": biz_info}
+        workflow_env = main._workflow_env(request)
+        self.assertEqual(json.loads(workflow_env["BIZ_INFO_JSON"]), biz_info)
+        header_name, header_value = workflow_env["ANTHROPIC_CUSTOM_HEADERS"].split(": ", 1)
+        self.assertEqual(header_name, "x-litellm-spend-logs-metadata")
+        self.assertTrue(header_value.isascii())
+        self.assertEqual(json.loads(json.loads(header_value)["bizInfo"]), biz_info)
+        self.assertEqual(
+            json.loads(main._codex_mcp_env("task-biz-info", request)["BIZ_INFO_JSON"]),
+            biz_info,
+        )
+
+    def test_biz_info_header_preserves_existing_claude_headers(self) -> None:
+        request = {**self.request, "bizInfo": {"bizId": "task-1"}}
+        with patch.dict(
+            main.os.environ,
+            {"ANTHROPIC_CUSTOM_HEADERS": "x-existing-header: existing-value"},
+        ):
+            custom_headers = main._workflow_env(request)["ANTHROPIC_CUSTOM_HEADERS"]
+        self.assertTrue(custom_headers.startswith("x-existing-header: existing-value\n"))
+        self.assertIn("x-litellm-spend-logs-metadata: ", custom_headers)
+
+    def test_mcp_model_env_maps_openai_profile_directly(self) -> None:
+        env = main._mcp_model_env(
+            {
+                "api_format": "openai",
+                "base_url": "https://gateway.example/v1",
+                "api_key": "secret",
+                "model_name": "vision-model",
+            }
+        )
+        self.assertEqual(env["OPENAI_BASE_URL"], "https://gateway.example/v1")
+        self.assertEqual(env["OPENAI_API_KEY"], "secret")
+        self.assertEqual(env["OPENAI_MODEL"], "vision-model")
+        self.assertEqual(env["MODEL_API_FORMAT"], "openai")
+
+    def test_mcp_model_env_normalizes_gemini_native_profile(self) -> None:
+        for base_url in (
+            "https://generativelanguage.googleapis.com",
+            "https://generativelanguage.googleapis.com/v1beta",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ):
+            with self.subTest(base_url=base_url):
+                env = main._mcp_model_env(
+                    {
+                        "api_format": "gemini",
+                        "base_url": base_url,
+                        "api_key": "gemini-secret",
+                        "model_name": "gemini-test",
+                    }
+                )
+                self.assertEqual(
+                    env["OPENAI_BASE_URL"],
+                    "https://generativelanguage.googleapis.com/v1beta/openai",
+                )
+                self.assertEqual(env["MODEL_API_FORMAT"], "gemini")
+
+    def test_mcp_model_env_maps_vertex_service_account(self) -> None:
+        credential = {
+            "project_id": "astro-project",
+            "client_email": "agent@astro-project.iam.gserviceaccount.com",
+        }
+        with patch.object(
+            main,
+            "service_account_access_token",
+            return_value=("short-lived-token", credential),
+        ):
+            env = main._mcp_model_env(
+                {
+                    "api_format": "vertex",
+                    "base_url": "https://us-central1-aiplatform.googleapis.com",
+                    "api_key": "{encrypted service account json}",
+                    "model_name": "gemini-2.5-flash",
+                }
+            )
+        self.assertEqual(env["OPENAI_API_KEY"], "short-lived-token")
+        self.assertEqual(env["OPENAI_MODEL"], "google/gemini-2.5-flash")
+        self.assertEqual(env["MODEL_API_FORMAT"], "vertex")
+        self.assertEqual(
+            env["OPENAI_BASE_URL"],
+            "https://us-central1-aiplatform.googleapis.com/v1beta1/projects/astro-project/locations/us-central1/endpoints/openapi",
+        )
+
     # modified by zl: verify transport configuration stays outside MCP fitting APIs.
     def test_agent_prompt_keeps_transport_out_of_mcp_tool_arguments(self) -> None:
         prompt = main._build_ai_prompt("task-transport", {**self.request, "fit_type": "ai"})
@@ -80,7 +183,7 @@ class AgentBackendTests(unittest.TestCase):
             self.assertIn("stream-json", command)
             config = json.loads(command[command.index("--mcp-config") + 1])
             server = config["mcpServers"]["galaxy_morphology_mcp"]
-            self.assertEqual(server["command"], "bash")
+            self.assertEqual(server["command"], "/bin/bash")
             allowed_tools = command[command.index("--allowedTools") + 1].split(",")
             self.assertIn("WaitForMcpServers", allowed_tools)
             self.assertEqual(main._agent_cwd(self.request), str(main.SETTINGS.mcp_root))
@@ -281,7 +384,12 @@ class AgentBackendTests(unittest.TestCase):
                         "node_id": node_id,
                         "fit_type": "AI",
                         "fit_max_round": 2,
+                        "fit_instruction": "固定 bulge 的 Sérsic index 为 n=4。",
                         "data_type": data_type,
+                        "bizInfo": {
+                            "fit_task_id": "TASK-PLATFORM-V4",
+                            "fit_task_target_id": f"TARGET-{node_id}",
+                        },
                         "current_metadata": {
                             "round_index": 1,
                             "input_dir": str(source_input),
@@ -320,6 +428,9 @@ class AgentBackendTests(unittest.TestCase):
                 self.assertEqual(request["local_platform"]["stage_input_dir"], str(expected_root))
                 self.assertTrue((expected_root / "output").is_dir())
                 self.assertFalse((expected_root / "input").exists())
+                self.assertIn("平台拟合要求", request["instructions"])
+                self.assertIn("固定 bulge 的 Sérsic index 为 n=4", request["instructions"])
+                self.assertEqual(request["bizInfo"]["fit_task_id"], "TASK-PLATFORM-V4")
 
     # modified by zl: prevent zero-round agent exits from being reported as successful workflows.
     def test_zero_fit_round_is_business_failure(self) -> None:

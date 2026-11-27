@@ -30,10 +30,27 @@ from uuid import uuid4
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, model_validator
+from cryptography.fernet import Fernet, InvalidToken
+from google_service_account import (
+    service_account_access_token,
+    vertex_model_name,
+    vertex_openai_base_url,
+)
 
 
 def load_local_env() -> None:
-    env_file = Path(__file__).resolve().parent / ".env"
+    """Load the local service environment from one ``.env`` file.
+
+    Local execution uses the repository-root ``.env`` as its complete source
+    of defaults.  ``COMMUNICATION_ENV_FILE`` may point to another complete env
+    file when an explicit deployment profile is needed.  Values already set
+    in the process environment always have the highest priority.
+    """
+
+    service_root = Path(__file__).resolve().parent
+    explicit_keys = set(os.environ)
+    configured_file = os.getenv("COMMUNICATION_ENV_FILE", "").strip()
+    env_file = Path(configured_file).expanduser() if configured_file else service_root / ".env"
     if not env_file.is_file():
         return
     for raw_line in env_file.read_text(encoding="utf-8").splitlines():
@@ -42,8 +59,9 @@ def load_local_env() -> None:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+        if not key or key in explicit_keys:
+            continue
+        os.environ[key] = value.strip().strip('"').strip("'")
 
 
 load_local_env()
@@ -188,6 +206,8 @@ class GalfitWorkflowIn(BaseModel):
     options: list[str] = Field(default_factory=lambda: ["-o"])
     max_rounds: int = Field(default=8, ge=1, le=30)
     instructions: str = Field(default="", max_length=8000)
+    # modified by zl: preserve opaque platform bizInfo without parsing it.
+    biz_info: Any = Field(default=None, alias="bizInfo")
     idempotency_key: str | None = Field(default=None, max_length=128)
 
 
@@ -228,6 +248,9 @@ class LocalFitRequestIn(BaseModel):
     # Human requests are normalized to one direct fitting round later, so the
     # platform may omit this field or explicitly send zero.
     fit_max_round: int = Field(default=1, ge=0, le=30)
+    # Scientific requirements belong to the fitting contract itself. Keep
+    # bizInfo opaque for deployment/accounting integrations.
+    fit_instruction: str = Field(default="", max_length=8000)
     fitting_mode: str | None = None
     args: list[str] | str | None = None
     workplace: str | None = None
@@ -237,10 +260,15 @@ class LocalFitRequestIn(BaseModel):
     parent_node_id: str | None = None
     platform_callback_url: str | None = None
     idempotency_key: str | None = Field(default=None, max_length=128)
+    # Encrypted per-user model profiles. The service persists only this opaque
+    # token; plaintext API keys exist only in the spawned process environment.
+    model_settings_token: str | None = Field(default=None, max_length=20000)
     # Compatibility fields used by the previous backend human-fit contract.
     lyric_file: str | None = None
     output_path: str | None = None
     callback_url: str | None = None
+    # modified by zl: preserve opaque platform bizInfo without parsing it.
+    biz_info: Any = Field(default=None, alias="bizInfo")
     legacy_human_request: bool = Field(default=False, exclude=True)
 
     @model_validator(mode="before")
@@ -295,11 +323,9 @@ class LocalFitRequestIn(BaseModel):
             "legacy_human_request": True,
         }
 
-    @model_validator(mode="after")
-    def validate_rounds_for_fit_type(self) -> "LocalFitRequestIn":
-        if self.fit_type.strip().lower() == "ai" and self.fit_max_round < 1:
-            raise ValueError("fit_max_round must be at least 1 when fit_type is AI")
-        return self
+    # fit_max_round=0 means that the platform does not impose a scientific
+    # round cap. The Agent/MCP workflow decides when the result is sufficient;
+    # process timeout and cancellation remain operational safety controls.
 
 
 def _connect() -> sqlite3.Connection:
@@ -354,6 +380,38 @@ def recover_interrupted_tasks() -> None:
         }
         _set_task(task_id, "failed", result, finished_at=now(), pid=None)
         _append_event(task_id, "workflow.failed", result)
+
+
+def resume_queued_tasks() -> list[asyncio.Task[None]]:
+    """Recreate in-memory workers for durable tasks that have not started yet.
+
+    Queued workflows are persisted before their asyncio task is created.  A
+    service restart therefore needs to recreate those asyncio tasks; otherwise
+    the database continues to report ``queued`` while no worker can consume
+    them.
+    """
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT task_id, request_json FROM galfit_tasks WHERE state = 'queued' "
+            "ORDER BY created_at, task_id"
+        ).fetchall()
+    resumed: list[asyncio.Task[None]] = []
+    for row in rows:
+        task_id = str(row["task_id"])
+        try:
+            request = json.loads(row["request_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            result = {
+                "error": f"invalid persisted workflow request: {exc}",
+                "exit_code": None,
+                "business_state": "failed",
+            }
+            _set_task(task_id, "failed", result, finished_at=now(), pid=None)
+            _append_event(task_id, "workflow.failed", result)
+            continue
+        _append_event(task_id, "workflow.resumed", {"reason": "service_restart"})
+        resumed.append(asyncio.create_task(_run_workflow(task_id, request)))
+    return resumed
 
 
 def validate_deployment() -> None:
@@ -599,6 +657,7 @@ def _validate_workflow_request(body: GalfitWorkflowIn) -> dict[str, Any]:
         "options": body.options,
         "max_rounds": body.max_rounds,
         "instructions": body.instructions,
+        "bizInfo": body.biz_info,
     }
 
 
@@ -1225,16 +1284,23 @@ def _stage_local_fit_request(body: LocalFitRequestIn) -> dict[str, Any]:
             "config_rewrite": rewrite_info,
         }
 
+    platform_instruction = body.fit_instruction.strip()
+    workflow_instruction = (
+        "严格遵循对应 workflow，完成本地平台提交的星系分解。"
+        f" 平台 owner={owner}, project_name={project_name}, galaxy_id={galaxy_id},"
+        f" initial_node_id={node_id}, data_type={data_type}, fit_type={fit_type}。"
+    )
+    if platform_instruction:
+        workflow_instruction += f"\n\n平台拟合要求：\n{platform_instruction}"
+
     return {
         **{key: value for key, value in request_config.items() if key != "feedme_paths"},
         "data_type": data_type,
         "fit_type": fit_type,
         "max_rounds": effective_max_rounds,
-        "instructions": (
-            "严格遵循对应 workflow，完成本地模拟平台提交的星系分解。"
-            f" 本地模拟平台 owner={owner}, project_name={project_name}, galaxy_id={galaxy_id},"
-            f" initial_node_id={node_id}, data_type={data_type}, fit_type={fit_type}。"
-        ),
+        "instructions": workflow_instruction,
+        "bizInfo": body.biz_info,
+        "model_settings_token": body.model_settings_token,
         "local_platform": {
             "owner": owner,
             "project_name": project_name,
@@ -1309,9 +1375,12 @@ async def _ensure_platform_node_for_round(task_id: str, request: dict[str, Any],
 def _round_artifact_upload_name(data_type: str, name: str) -> str | None:
     normalized_type = data_type.strip().lower()
     normalized_name = name.lower()
+    # FITS data remain in the immutable per-galaxy source/raw area (or in the
+    # disposable communication staging workspace). Never duplicate them into
+    # a persistent result-node input/output directory.
+    if Path(normalized_name).suffix in {".fit", ".fits", ".fts", ".fz"} or re.fullmatch(r"galfit\.\d+", normalized_name):
+        return None
     if normalized_type == "single_band":
-        if normalized_name == "subcomps.fits" or re.fullmatch(r"galfit\.\d+", normalized_name):
-            return None
         if normalized_name == "galfit_comparison.png":
             return "galfit_comparisonimage_fit.png"
     elif normalized_type == "multi_band":
@@ -1450,7 +1519,7 @@ async def _callback_local_platform(task_id: str, request: dict[str, Any], fit_ev
     await _ensure_platform_node_for_round(task_id, request, round_index)
     copied = _copy_round_artifacts_to_platform(task_id, request, fit_event, round_index)
     fit_max_round = int(local["fit_max_round"])
-    has_next_round = round_index < fit_max_round
+    has_next_round = fit_max_round == 0 or round_index < fit_max_round
     payload = {
         "task_id": task_id,
         "event": "fit_round_finished",
@@ -1574,6 +1643,53 @@ def _copy_final_agent_artifacts_to_platform(task_id: str, request: dict[str, Any
     return {"final_artifacts": copied, "failed_final_artifacts": failed}
 
 
+def _best_round_selection(task_id: str, request: dict[str, Any]) -> dict[str, Any]:
+    """Map the agent archive selected by the final audit back to a platform node.
+
+    The morphology workflow records the winning archive in ``.best_round.json``.
+    Platform node IDs are allocated independently, so the stable bridge is the
+    fit-round event that contains both the archive directory and round index.
+    """
+    local = request.get("local_platform") or {}
+    stage_dir = Path(str(request.get("galaxy_dir") or ""))
+    manifest_path = stage_dir / ".best_round.json"
+    if not manifest_path.is_file():
+        return {}
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return {}
+    round_label = str(manifest.get("round_label") or "").strip()
+    if not round_label:
+        return {}
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT payload_json FROM galfit_task_events WHERE task_id = ? AND type = 'fit_round_finished' ORDER BY sequence",
+            (task_id,),
+        ).fetchall()
+    for row in rows:
+        try:
+            event = json.loads(row["payload_json"])
+        except (ValueError, TypeError, KeyError):
+            continue
+        archive_dir = Path(str(event.get("archive_dir") or ""))
+        if archive_dir.name != round_label:
+            continue
+        try:
+            round_index = int(event.get("round_index"))
+        except (TypeError, ValueError):
+            continue
+        node_info = local.get("round_nodes", {}).get(str(round_index)) or {}
+        node_id = node_info.get("node_id")
+        if node_id:
+            return {
+                "selected_node_id": str(node_id),
+                "selected_round_index": round_index,
+                "selected_archive_label": round_label,
+            }
+    return {"selected_archive_label": round_label}
+
+
 async def _callback_local_platform_workflow_finished(task_id: str, request: dict[str, Any], result: dict[str, Any]) -> None:
     local = request.get("local_platform")
     if not local or not local.get("platform_callback_url"):
@@ -1595,6 +1711,7 @@ async def _callback_local_platform_workflow_finished(task_id: str, request: dict
         )
         return
     final_copy = _copy_final_agent_artifacts_to_platform(task_id, request)
+    best_round = _best_round_selection(task_id, request)
     payload = {
         "task_id": task_id,
         "event": "workflow_finished",
@@ -1605,13 +1722,20 @@ async def _callback_local_platform_workflow_finished(task_id: str, request: dict
         "galaxy_id": local["galaxy_id"],
         "initial_node_id": local.get("initial_node_id"),
         "node_id": local.get("last_completed_node_id") or local.get("current_node_id"),
+        "selected_node_id": best_round.get("selected_node_id"),
+        "selected_round_index": best_round.get("selected_round_index"),
+        "selected_archive_label": best_round.get("selected_archive_label"),
         "last_completed_round_index": local.get("last_completed_round_index"),
         "fit_round_count": result.get("fit_round_count"),
         "requested_rounds": result.get("requested_rounds"),
         "has_next_round": False,
         "final_artifacts": final_copy["final_artifacts"],
         "failed_final_artifacts": final_copy["failed_final_artifacts"],
-        "message": (result.get("final_messages") or [None])[-1],
+        "message": (
+            (result.get("final_messages") or [None])[-1]
+            or result.get("error")
+            or ("Fitting failed" if result.get("business_state") == "failed" else "")
+        ),
     }
     response = await asyncio.to_thread(_post_json, local["platform_callback_url"], payload)
     _append_event(task_id, "local_platform.workflow_finished_callback_sent", {"request": payload, "response": response})
@@ -1642,6 +1766,11 @@ Never fall back to Bash, direct Python imports, or direct GALFIT/GalfitS executi
 
 def _build_ai_prompt(task_id: str, request: dict[str, Any]) -> str:
     readiness_requirement = _mcp_readiness_requirement()
+    round_policy = (
+        "Agent-controlled (no platform-imposed round limit; stop when the scientific result is sufficient)"
+        if int(request.get("max_rounds") or 0) == 0
+        else str(request["max_rounds"])
+    )
     if request.get("data_type") == "multi_band":
         fitting_mode = request.get("fitting_mode") or "Image Fitting"
         return f"""You are the execution agent for a multi-band galaxy decomposition task.
@@ -1656,7 +1785,7 @@ Galaxy directory: {request['galaxy_dir']}
 Initial GalfitS lyric file (absolute path): {request['lyric_file']}
 Fitting mode: {fitting_mode}
 Extra GalfitS args: {json.dumps(request.get('extra_args') or [])}
-Maximum fitting rounds: {request['max_rounds']}
+Maximum fitting rounds: {round_policy}
 Task-specific fit-event delivery is configured by the service environment.
 Scientific/user instructions: {request['instructions'] or 'None.'}
 
@@ -1680,7 +1809,7 @@ Task id: {task_id}
 Galaxy directory: {request['galaxy_dir']}
 Initial feedme (absolute path): {request['feedme']}
 GALFIT options: {json.dumps(request['options'])}
-Maximum fitting rounds: {request['max_rounds']}
+Maximum fitting rounds: {round_policy}
 Task-specific fit-event delivery is configured by the service environment.
 Scientific/user instructions: {request['instructions'] or 'None.'}
 
@@ -1758,9 +1887,69 @@ def _mcp_command(task_id: str) -> str:
     )
 
 
+def _request_model_settings(request: dict[str, Any]) -> dict[str, dict[str, str]]:
+    token = str(request.get("model_settings_token") or "").strip()
+    if not token:
+        return {}
+    key_path = Path(
+        os.getenv("MODEL_SETTINGS_KEY_FILE", "/data/platform/model-settings.key")
+    ).expanduser()
+    try:
+        key = key_path.read_bytes().strip()
+        payload = Fernet(key).decrypt(token.encode("ascii")).decode("utf-8")
+        parsed = json.loads(payload)
+    except (OSError, InvalidToken, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("Unable to decrypt per-user model settings") from exc
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _mcp_model_env(profile: dict[str, Any]) -> dict[str, str]:
+    """Translate the platform's canonical MCP profile to tool environment variables."""
+    if not profile:
+        return {}
+    api_format = str(profile.get("api_format") or "openai").lower()
+    base_url = str(profile.get("base_url") or "").rstrip("/")
+    api_key = str(profile.get("api_key") or "")
+    model_name = str(profile.get("model_name") or "")
+    if api_format == "vertex":
+        access_token, credential = service_account_access_token(api_key)
+        return {
+            "OPENAI_API_KEY": access_token,
+            "OPENAI_BASE_URL": vertex_openai_base_url(base_url, credential["project_id"]),
+            "OPENAI_MODEL": vertex_model_name(model_name),
+            "MODEL_API_FORMAT": "vertex",
+            "GOOGLE_SERVICE_ACCOUNT_JSON": api_key,
+            "VERTEX_API_ROOT": base_url,
+        }
+    if api_format == "gemini":
+        # MCP VLM tools use the OpenAI SDK internally. Google's OpenAI
+        # compatibility route preserves multimodal/history behavior while the
+        # platform still validates the same key against Gemini native REST.
+        for suffix in ("/v1beta/openai", "/v1beta"):
+            if base_url.endswith(suffix):
+                base_url = base_url[: -len(suffix)].rstrip("/")
+                break
+        compatible_url = f"{base_url}/v1beta/openai"
+        return {
+            "OPENAI_API_KEY": api_key,
+            "OPENAI_BASE_URL": compatible_url,
+            "OPENAI_MODEL": model_name,
+            "MODEL_API_FORMAT": "gemini",
+        }
+    return {
+        "OPENAI_API_KEY": api_key,
+        "OPENAI_BASE_URL": base_url,
+        "OPENAI_MODEL": model_name,
+        "MODEL_API_FORMAT": "openai",
+    }
+
+
 # modified by zl: build the complete task-scoped environment required for
 # conditional GALFIT/GalfitS tool registration and optional VLM analysis.
-def _codex_mcp_env(task_id: str) -> dict[str, str]:
+def _codex_mcp_env(task_id: str, request: dict[str, Any]) -> dict[str, str]:
+    profiles = _request_model_settings(request)
+    mcp_profile = profiles.get("mcp_analysis") or {}
+    model_values = _mcp_model_env(mcp_profile)
     values = {
         "PYTHONPATH": os.getenv("PYTHONPATH", "src"),
         "MPLCONFIGDIR": os.getenv("MPLCONFIGDIR", "/tmp/matplotlib-galaxy-mcp"),
@@ -1768,12 +1957,17 @@ def _codex_mcp_env(task_id: str) -> dict[str, str]:
         "GALFIT_BIN": os.getenv("GALFIT_BIN", ""),
         "GALFITS_BIN": os.getenv("GALFITS_BIN", ""),
         "GS_DATA_PATH": os.getenv("GS_DATA_PATH", ""),
-        "OPENAI_API_KEY": os.getenv("OPENAI_API_KEY", ""),
-        "OPENAI_BASE_URL": os.getenv("OPENAI_BASE_URL", ""),
-        "OPENAI_MODEL": os.getenv("OPENAI_MODEL", ""),
+        "OPENAI_API_KEY": model_values.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", ""),
+        "OPENAI_BASE_URL": model_values.get("OPENAI_BASE_URL") or os.getenv("OPENAI_BASE_URL", ""),
+        "OPENAI_MODEL": model_values.get("OPENAI_MODEL") or os.getenv("OPENAI_MODEL", ""),
+        "MODEL_API_FORMAT": model_values.get("MODEL_API_FORMAT", ""),
+        "GOOGLE_SERVICE_ACCOUNT_JSON": model_values.get("GOOGLE_SERVICE_ACCOUNT_JSON", ""),
+        "VERTEX_API_ROOT": model_values.get("VERTEX_API_ROOT", ""),
         "ANALYSIS_MODE": os.getenv("ANALYSIS_MODE", ""),
         "MCP_ALLOWED_HOSTS": os.getenv("MCP_ALLOWED_HOSTS", ""),
     }
+    if request.get("bizInfo") is not None:
+        values["BIZ_INFO_JSON"] = json.dumps(request["bizInfo"], ensure_ascii=False)
     return {key: value for key, value in values.items() if value}
 
 
@@ -1814,7 +2008,7 @@ def _codex_command(task_id: str, request: dict[str, Any]) -> list[str]:
         "mcp_servers.galaxy_morphology_mcp.cwd=" + json.dumps(str(SETTINGS.mcp_root)),
         "-c",
         "mcp_servers.galaxy_morphology_mcp.env="
-        + _toml_inline_string_map(_codex_mcp_env(task_id)),
+        + _toml_inline_string_map(_codex_mcp_env(task_id, request)),
         # `codex exec` has no interactive approver.  Explicitly authorize the
         # MCP tools used by workflow_galfit.md so a tool call cannot be turned
         # into a misleading "user cancelled" event.
@@ -1907,8 +2101,10 @@ def _claude_command(task_id: str, request: dict[str, Any]) -> list[str]:
         "WaitForMcpServers,Read,Write,Edit,Glob,Grep,Bash,mcp__galaxy_morphology_mcp__*",
         "--no-session-persistence",
     ]
-    if SETTINGS.claude_model:
-        command.extend(["--model", SETTINGS.claude_model])
+    fit_profile = _request_model_settings(request).get("fit_agent") or {}
+    selected_model = str(fit_profile.get("model_name") or SETTINGS.claude_model).strip()
+    if selected_model:
+        command.extend(["--model", selected_model])
     if SETTINGS.claude_max_budget_usd:
         command.extend(["--max-budget-usd", SETTINGS.claude_max_budget_usd])
     command.append(_build_prompt(task_id, request))
@@ -1929,6 +2125,41 @@ def _agent_cwd(request: dict[str, Any]) -> str:
     ):
         return str(SETTINGS.mcp_root)
     return request["galaxy_dir"]
+
+
+# modified by zl: pass opaque per-task bizInfo to Agent/MCP subprocesses.
+def _workflow_env(request: dict[str, Any]) -> dict[str, str]:
+    env = os.environ.copy()
+    profiles = _request_model_settings(request)
+    fit_profile = profiles.get("fit_agent") or {}
+    mcp_profile = profiles.get("mcp_analysis") or {}
+    if fit_profile.get("base_url"):
+        env["ANTHROPIC_BASE_URL"] = str(fit_profile["base_url"])
+    if fit_profile.get("api_key"):
+        env["ANTHROPIC_AUTH_TOKEN"] = str(fit_profile["api_key"])
+        env["ANTHROPIC_API_KEY"] = str(fit_profile["api_key"])
+    for key, value in _mcp_model_env(mcp_profile).items():
+        if value:
+            env[key] = value
+    if request.get("bizInfo") is not None:
+        biz_info_json = json.dumps(
+            request["bizInfo"], ensure_ascii=False, separators=(",", ":")
+        )
+        env["BIZ_INFO_JSON"] = biz_info_json
+        # modified by zl: attach task accounting metadata to every Claude request.
+        spend_metadata = json.dumps(
+            # HTTP header values must remain ASCII-safe.  The nested JSON
+            # string still round-trips to the original Unicode instruction.
+            {"bizInfo": biz_info_json}, ensure_ascii=True, separators=(",", ":")
+        )
+        task_header = f"x-litellm-spend-logs-metadata: {spend_metadata}"
+        existing_headers = env.get("ANTHROPIC_CUSTOM_HEADERS", "").strip()
+        env["ANTHROPIC_CUSTOM_HEADERS"] = (
+            f"{existing_headers}\n{task_header}" if existing_headers else task_header
+        )
+    else:
+        env.pop("BIZ_INFO_JSON", None)
+    return env
 
 
 def _direct_fit_command(task_id: str, request: dict[str, Any]) -> list[str]:
@@ -2095,6 +2326,21 @@ async def _run_workflow(task_id: str, request: dict[str, Any]) -> None:
     galaxy_dir = request["galaxy_dir"]
     lock = GALAXY_LOCKS.setdefault(galaxy_dir, asyncio.Lock())
     async with WORKER_SEMAPHORE, lock:
+        async def fail_before_start(message: str) -> None:
+            result = {
+                "error": message,
+                "exit_code": None,
+                "fit_round_count": _count_events(task_id, "fit_round_finished"),
+                "requested_rounds": int(request.get("max_rounds") or 0),
+                "business_state": "failed",
+            }
+            _set_task(task_id, "failed", result, finished_at=now(), pid=None)
+            _append_event(task_id, "workflow.failed", result)
+            try:
+                await _callback_local_platform_workflow_finished(task_id, request, result)
+            except Exception:
+                LOGGER.exception("failed to send pre-start failure callback: task_id=%s", task_id)
+
         task = _task_row(task_id)
         if task is None or task["state"] == "cancelled":
             return
@@ -2103,14 +2349,12 @@ async def _run_workflow(task_id: str, request: dict[str, Any]) -> None:
             workflow_file = SETTINGS.mcp_root / "src/mcp_server.py"
         if not workflow_file.is_file() or not SETTINGS.mcp_root.is_dir():
             message = "Fixed galaxy morphology MCP configuration is invalid"
-            _set_task(task_id, "failed", {"error": message}, finished_at=now())
-            _append_event(task_id, "workflow.failed", {"error": message})
+            await fail_before_start(message)
             return
         try:
             command = _workflow_command(task_id, request)
         except ValueError as exc:
-            _set_task(task_id, "failed", {"error": str(exc)}, finished_at=now())
-            _append_event(task_id, "workflow.failed", {"error": str(exc)})
+            await fail_before_start(str(exc))
             return
         executor = _workflow_executor(request)
         workflow_cwd = _workflow_cwd(request)
@@ -2133,10 +2377,10 @@ async def _run_workflow(task_id: str, request: dict[str, Any]) -> None:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=SETTINGS.agent_stream_limit_bytes,
+                env=_workflow_env(request),
             )
         except OSError as exc:
-            _set_task(task_id, "failed", {"error": str(exc)}, finished_at=now())
-            _append_event(task_id, "workflow.failed", {"error": str(exc)})
+            await fail_before_start(str(exc))
             return
         RUNNING_PROCESSES[task_id] = process
         _set_task(task_id, "running", pid=process.pid)
@@ -2272,6 +2516,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     init_database()
     recover_interrupted_tasks()
     await asyncio.to_thread(cleanup_staging_once)
+    resumed_tasks = resume_queued_tasks()
     cleanup_task = asyncio.create_task(_stage_cleanup_loop())
     try:
         yield
@@ -2279,6 +2524,10 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         cleanup_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
+        for task in resumed_tasks:
+            task.cancel()
+        if resumed_tasks:
+            await asyncio.gather(*resumed_tasks, return_exceptions=True)
 
 
 app = FastAPI(title="Agent Communication Service", version="0.2.0", lifespan=lifespan)

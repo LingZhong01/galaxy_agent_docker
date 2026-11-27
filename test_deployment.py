@@ -67,6 +67,7 @@ class DeploymentTests(unittest.TestCase):
                 patch.object(main.SETTINGS, "database_file", root / "db" / "service.sqlite3"),
                 patch.object(main.SETTINGS, "log_dir", root / "logs"),
                 patch.object(main.SETTINGS, "codex_bin", "definitely-missing-codex"),
+                patch.object(main.SETTINGS, "claude_bin", "definitely-missing-claude"),
                 patch.object(main.SETTINGS, "direct_fit_python", "definitely-missing-python-1"),
                 patch.object(main.SETTINGS, "direct_galfits_python", "definitely-missing-python-2"),
             ):
